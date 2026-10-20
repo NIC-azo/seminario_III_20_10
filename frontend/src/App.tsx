@@ -251,9 +251,10 @@ function App() {
                   </p>
                   <h1>Tu consulta merece una respuesta con fundamento.</h1>
                   <p className="welcome-copy">
-                    Explora la Constitución Política y el Código Penal peruano.
-                    Cada respuesta muestra los artículos y fragmentos que la
-                    sustentan.
+                    Consulta artículos, derechos y principios constitucionales,
+                    además de delitos, penas y responsabilidad penal. Las
+                    respuestas se limitan al contenido indexado de la
+                    Constitución y el Código Penal, con sus fuentes visibles.
                   </p>
                   <div className="suggestion-grid">
                     {suggestedQuestions.map((question, index) => (

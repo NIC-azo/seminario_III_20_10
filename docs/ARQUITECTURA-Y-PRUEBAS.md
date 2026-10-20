@@ -58,10 +58,13 @@ una presentación y comprobarse con la publicación normativa oficial.
   Modelos predeterminados: `nomic-embed-text` y `qwen2.5:3b`. Ollama no se
   instala con npm; puede ejecutarse nativamente o como contenedor Docker
   separado.
-- `chatController.ts` gestiona sesiones en memoria, limita el historial enviado
-  al modelo, solicita un objeto JSON estructurado y valida cada evidencia contra
-  el contenido literal del artículo citado. Una respuesta no verificable no se
-  presenta como válida y causa HTTP 502 con fuentes recuperadas.
+- `chatController.ts` gestiona sesiones en memoria, solicita un objeto JSON
+  estructurado y valida cada evidencia contra el contenido literal del artículo
+  citado. Las consultas independientes no reciben el historial anterior; solo
+  se envía para seguimientos contextuales explícitos. Cada pregunta respondida
+  se almacena en caché normalizada por sesión para repetir la misma respuesta.
+  Una respuesta no verificable no se presenta como válida y causa HTTP 502 con
+  fuentes recuperadas.
 - Las consultas reconocidas por artículo/inciso, título o tema pueden contestar
   directamente desde los documentos, sin pedir síntesis al modelo. Las citas
   directas se limitan a 500 caracteres; el panel conserva acceso al artículo
@@ -105,12 +108,12 @@ persistencia al reiniciar el servidor.
 
 | Comando/área | Resultado |
 |---|---|
-| `backend: npm test` | **8/8 aprobadas, 0 fallidas, 0 omitidas** con los JSON ETL locales presentes. |
+| `backend: npm test` | **13/13 aprobadas, 0 fallidas, 0 omitidas** con los JSON ETL locales presentes. |
 | `backend: npm run typecheck` | Aprobado (`tsc --noEmit`). |
 | `frontend: npm run build` | Aprobado: TypeScript y bundle de producción Vite. |
 | `frontend: npm run lint` | Aprobado, sin avisos ni errores de Oxlint. |
 
-Cobertura funcional de los ocho tests:
+Cobertura funcional de los trece tests:
 
 1. ETL JSON → servicio Ollama simulado → LanceDB → Express `/api/chat`.
 2. Error explícito cuando Ollama local no está disponible.
@@ -118,10 +121,19 @@ Cobertura funcional de los ocho tests:
    store; recuperación del artículo constitucional 2 y metadatos asociados.
 4. Respuesta directa por artículo limitada y con evidencia literal.
 5. Respuesta directa por título limitada y con evidencia literal.
-6. ETL segmenta artículos, jerarquía y jurisprudencia, deduplicando URL
-   repetidas exactas.
-7. Error explícito si el HTML carece del contenedor normativo esperado.
-8. Error explícito cuando no se pudo extraer ningún artículo.
+6. Respuesta repetida por artículo explícito permanece determinista y cita el
+   artículo solicitado.
+7. Consulta sobre edad para votar responde desde los artículos 30 y 31 con
+   evidencia de ambos.
+8. Si faltan los artículos necesarios para la edad del voto, devuelve evidencia
+   insuficiente sin inventar respuesta.
+9. ETL extrae artículos con jerarquía y notas de jurisprudencia.
+10. Error explícito si el HTML carece del contenedor normativo esperado.
+11. Error explícito cuando no se pudo extraer ningún artículo.
+12. Las tres consultas sugeridas en la pantalla inicial se contestan con citas
+    extractivas sin depender de la generación del modelo.
+13. Una pregunta repetida con variación de mayúsculas o puntuación reutiliza la
+    respuesta de la sesión, sin invocar otra vez embeddings ni el LLM.
 
 `npm test` no necesita modelos reales: los tests del backend usan un servidor
 Ollama simulado. En un clon sin JSON procesados, el test que indexa el corpus
@@ -143,6 +155,19 @@ En la revisión documental previa a la publicación, el contenedor Docker
 `mini-juztina-ollama` existía pero estaba detenido (`Exited`); la ejecución de
 referencia con Ollama real ocurrió antes, cuando el servicio estaba activo. Los
 tests automatizados no requieren arrancar ese contenedor.
+
+En la verificación del 20 de octubre de 2026, con la API y Ollama locales
+activos, se repitió la consulta del artículo 4 y ambas respuestas fueron
+idénticas. La consulta «¿a qué edad puedo votar?» se respondió con los artículos
+30 y 31 de la Constitución. La edad de ciudadanía y las condiciones de
+inscripción/voto se respaldaron con extractos literales; no se usó el modelo
+generativo para inventar una respuesta a partir de resultados poco pertinentes.
+Las tres consultas sugeridas en la pantalla inicial también se verificaron
+contra una instancia de validación de la API en `127.0.0.1:3002`, conectada al
+índice local y Ollama: artículo 2, principio de legalidad penal e igualdad
+devolvieron evidencia de los artículos correspondientes y las repeticiones
+dentro de una sesión fueron idénticas. El proceso previo en `127.0.0.1:3001`
+seguía ejecutando código anterior y debe reiniciarse para cargar los cambios.
 
 El usuario indicó que una consulta general demoró menos de 20 segundos en su
 equipo; es una observación puntual, no un SLA ni un tiempo garantizado. En la
@@ -210,7 +235,7 @@ GPU efectiva de Ollama. Los embeddings también consumen recursos al indexar.
 - `backend/.env`, `frontend/.env`, dependencias y builds.
 
 La prueba sintética ETL y las demás pruebas del backend siguen disponibles sin
-corpus. Para obtener los ocho tests completos en una clonación, prepara los dos
+corpus. Para obtener los trece tests completos en una clonación, prepara los dos
 HTML en las rutas de README, corre ETL y luego `npm test`.
 
 ## 6. Referencia de comandos

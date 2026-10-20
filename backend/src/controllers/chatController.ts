@@ -9,7 +9,8 @@ import type {
 import type { config } from "@/config.js";
 
 const MAX_SESSION_COUNT = 100;
-const MAX_HISTORY_MESSAGES = 12;
+const MAX_HISTORY_MESSAGES = 8;
+const MAX_CACHED_ANSWERS_PER_SESSION = 100;
 const MAX_CONTEXT_FRAGMENT_LENGTH = 1_200;
 const MAX_DIRECT_ANSWER_LENGTH = 500;
 const QUERY_STOP_WORDS = new Set([
@@ -40,7 +41,15 @@ Reglas obligatorias:
 - Esta respuesta es información documental general, no asesoría legal para un caso particular.`;
 
 interface ChatSession {
+  answers: Map<string, ChatResult>;
   messages: ChatMessage[];
+}
+
+interface ChatResult {
+  sessionId: string;
+  status: "answered" | "out_of_scope" | "insufficient_evidence";
+  answer: string;
+  sources: ChatSource[];
 }
 
 export interface ChatRequestBody {
@@ -232,6 +241,26 @@ function normalizeForMatching(value: string): string {
     .toLocaleLowerCase("es-PE");
 }
 
+function normalizeQuestionKey(value: string): string {
+  return normalizeForMatching(value)
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+function isContextualFollowUp(query: string): boolean {
+  const normalizedQuery = normalizeForMatching(query);
+  return (
+    /\b(eso|esa|ese|ello|ellos|ellas|anterior|mismo|misma|dicho)\b/u.test(
+      normalizedQuery,
+    ) ||
+    /\b(lo|la|los|las)\s+(anterior|mismo|mencionad\w*|citado\w*)\b/u.test(
+      normalizedQuery,
+    ) ||
+    /\b(resum\w*|ampl\w*|explic\w*|aclar\w*)\b/u.test(normalizedQuery)
+  );
+}
+
 function sourceGenitive(normName: string): string {
   return `${normalizeForMatching(normName).includes("constitucion") ? "de la" : "del"} ${normName}`;
 }
@@ -340,12 +369,96 @@ function explicitArticleRequest(
     : null;
 }
 
+function isVotingAgeQuestion(query: string): boolean {
+  const normalizedQuery = normalizeForMatching(query);
+  return (
+    /\b(edad|mayor|menor|dieciocho|18)\b/.test(normalizedQuery) &&
+    /\b(vot\w*|sufrag\w*|eleg\w*)\b/.test(normalizedQuery)
+  );
+}
+
+function sentenceContaining(content: string, term: string): string | null {
+  return (
+    content
+      .split(/(?<=[.!?])\s+/u)
+      .find((sentence) => normalizeForMatching(sentence).includes(term)) ?? null
+  );
+}
+
+function explicitVotingAgeAnswer(
+  query: string,
+  chunks: RetrievedLegalChunk[],
+): GeneratedAnswer | null {
+  if (!isVotingAgeQuestion(query)) {
+    return null;
+  }
+
+  const constitutionArticles = chunks
+    .map((chunk, index) => ({ chunk, index }))
+    .filter(({ chunk }) =>
+      normalizeForMatching(chunk.norm_name).includes("constitucion"),
+    );
+  const citizenship = constitutionArticles.find(
+    ({ chunk }) => chunk.article_number === "30",
+  );
+  const voting = constitutionArticles.find(
+    ({ chunk }) => chunk.article_number === "31",
+  );
+  const ageEvidence = citizenship
+    ? sentenceContaining(citizenship.chunk.content, "dieciocho")
+    : null;
+  const votingEvidence = voting
+    ? sentenceContaining(voting.chunk.content, "derecho al voto")
+    : null;
+  const registrationEvidence = voting
+    ? sentenceContaining(voting.chunk.content, "registro correspondiente")
+    : null;
+
+  if (
+    !citizenship ||
+    !voting ||
+    !ageEvidence ||
+    !votingEvidence ||
+    !registrationEvidence
+  ) {
+    return {
+      status: "insufficient_evidence",
+      claims: [],
+      message:
+        "No se encontraron completos los artículos constitucionales necesarios para verificar la edad y las condiciones del voto.",
+    };
+  }
+
+  return {
+    status: "answered",
+    claims: [
+      {
+        text: `La Constitución establece: «${ageEvidence}»`,
+        evidence: ageEvidence,
+        citation_ids: [`F${citizenship.index + 1}`],
+      },
+      {
+        text: "El derecho al voto corresponde a los ciudadanos en goce de su capacidad civil.",
+        evidence: votingEvidence,
+        citation_ids: [`F${voting.index + 1}`],
+      },
+      {
+        text: "Para ejercerlo, se requiere estar inscrito en el registro correspondiente.",
+        evidence: registrationEvidence,
+        citation_ids: [`F${voting.index + 1}`],
+      },
+    ],
+  };
+}
+
 function explicitTopicAnswer(
   query: string,
   chunks: RetrievedLegalChunk[],
 ): GeneratedAnswer | null {
   const normalizedQuery = normalizeForMatching(query);
-  if (!normalizedQuery.includes("discrimin")) {
+  const asksAboutDiscrimination = normalizedQuery.includes("discrimin");
+  const asksAboutEquality = normalizedQuery.includes("igualdad");
+  if (!asksAboutDiscrimination && !asksAboutEquality) {
     return null;
   }
 
@@ -355,70 +468,55 @@ function explicitTopicAnswer(
     return null;
   }
 
-  const sourceIndex = chunks.findIndex((chunk) => {
-    const sourceName = normalizeForMatching(chunk.norm_name);
-    return (
-      (asksAboutConstitution && sourceName.includes("constitucion")) ||
-      (asksAboutPenalCode && sourceName.includes("penal"))
-    );
-  });
-  if (sourceIndex < 0) {
+  const candidates = chunks
+    .map((chunk, index) => ({ chunk, index }))
+    .filter(({ chunk }) => {
+      const sourceName = normalizeForMatching(chunk.norm_name);
+      return (
+        (asksAboutConstitution && sourceName.includes("constitucion")) ||
+        (asksAboutPenalCode && sourceName.includes("penal"))
+      );
+    });
+  if (candidates.length === 0) {
     return null;
   }
 
-  const matchingTopicIndex = chunks.findIndex((chunk) => {
-    const sourceName = normalizeForMatching(chunk.norm_name);
-    const articleTitle = normalizeForMatching(chunk.article_title ?? "");
-    const content = normalizeForMatching(chunk.content);
-    const matchesNorm =
-      (asksAboutConstitution && sourceName.includes("constitucion")) ||
-      (asksAboutPenalCode && sourceName.includes("penal"));
-    return (
-      matchesNorm &&
-      (articleTitle.includes("discrimin") || content.includes("discrimin"))
-    );
-  });
-  const citationIndex = matchingTopicIndex >= 0 ? matchingTopicIndex : sourceIndex;
-  const source = chunks[citationIndex];
-  const normalizedContent = normalizeForMatching(source.content);
-  const topicIndex = normalizedContent.indexOf("discrimin");
-  let answerContent = source.content;
-  if (topicIndex >= 0) {
-    const sentenceStart = Math.max(
-      source.content.lastIndexOf(". ", topicIndex),
-      source.content.lastIndexOf("! ", topicIndex),
-      source.content.lastIndexOf("? ", topicIndex),
-    );
-    const start = sentenceStart < 0 ? 0 : sentenceStart + 2;
-    const sentenceEndCandidates = [
-      source.content.indexOf(". ", topicIndex),
-      source.content.indexOf("! ", topicIndex),
-      source.content.indexOf("? ", topicIndex),
-    ].filter((index) => index >= 0);
-    const sentenceEnd =
-      sentenceEndCandidates.length > 0
-        ? Math.min(...sentenceEndCandidates) + 1
-        : source.content.length;
-    answerContent = source.content.slice(start, sentenceEnd).trim();
-  } else {
-    const sentenceEnd = source.content.indexOf(". ");
-    if (sentenceEnd >= 0) {
-      answerContent = source.content.slice(0, sentenceEnd + 1).trim();
-    }
-  }
-
-  if (!answerContent) {
+  const matchingCandidates = candidates
+    .map(({ chunk, index }) => {
+      const articleTitle = normalizeForMatching(chunk.article_title ?? "");
+      const content = normalizeForMatching(chunk.content);
+      const contentMatch =
+        (asksAboutEquality && content.includes("igualdad")) ||
+        (asksAboutDiscrimination && content.includes("discrimin"));
+      const titleMatch =
+        (asksAboutEquality && articleTitle.includes("igualdad")) ||
+        (asksAboutDiscrimination && articleTitle.includes("discrimin"));
+      return {
+        chunk,
+        index,
+        score: (contentMatch ? 2 : 0) + (titleMatch ? 1 : 0),
+      };
+    })
+    .filter((candidate) => candidate.score > 0)
+    .sort((left, right) => right.score - left.score);
+  const selected = matchingCandidates[0] ?? candidates[0];
+  const source = selected.chunk;
+  const topicTerm = asksAboutDiscrimination ? "discrimin" : "igualdad";
+  const evidence = sentenceContaining(source.content, topicTerm);
+  if (!evidence) {
     return null;
   }
-  const excerpt = exactAnswerExcerpt(answerContent, query);
+  const excerpt = exactAnswerExcerpt(evidence, query);
 
   return {
     status: "answered",
     claims: [
       {
-        text: `El artículo ${source.article_number} ${sourceGenitive(source.norm_name)} establece: «${excerpt.prefix}${excerpt.text}${excerpt.suffix}»`,
+        text: asksAboutEquality
+          ? `El artículo ${source.article_number} ${sourceGenitive(source.norm_name)} aborda el tema «Igualdad ante la ley». Texto normativo: «${excerpt.prefix}${excerpt.text}${excerpt.suffix}»`
+          : `El artículo ${source.article_number} ${sourceGenitive(source.norm_name)} establece: «${excerpt.prefix}${excerpt.text}${excerpt.suffix}»`,
         evidence: excerpt.text,
-        citation_ids: [`F${citationIndex + 1}`],
+        citation_ids: [`F${selected.index + 1}`],
       },
     ],
   };
@@ -562,6 +660,15 @@ export class LegalChatService implements ChatService {
   }> {
     const sessionId = body.sessionId ?? randomUUID();
     const session = this.getSession(sessionId);
+    const questionKey = normalizeQuestionKey(body.message);
+    const cached = session.answers.get(questionKey);
+    if (cached) {
+      session.answers.delete(questionKey);
+      session.answers.set(questionKey, cached);
+      this.appendSessionMessages(session, body.message, cached.answer);
+      return cached;
+    }
+
     const articleRequest = explicitArticleRequest(body.message);
     const articleChunk = articleRequest
       ? this.vectorStore.findArticle(
@@ -569,7 +676,15 @@ export class LegalChatService implements ChatService {
           articleRequest.sourceType,
         )
       : null;
-    const chunks = articleChunk
+    const votingAgeChunks = isVotingAgeQuestion(body.message)
+      ? [
+        this.vectorStore.findArticle("30", "constitucion"),
+        this.vectorStore.findArticle("31", "constitucion"),
+      ].filter((chunk): chunk is RetrievedLegalChunk => chunk !== null)
+      : null;
+    const chunks = votingAgeChunks
+      ? votingAgeChunks
+      : articleChunk
       ? [articleChunk]
       : await this.vectorStore.search(
           (await this.ollama.embed([body.message]))[0],
@@ -578,13 +693,16 @@ export class LegalChatService implements ChatService {
         );
     const sources = chunks.map((chunk, index) => toSource(chunk, `F${index + 1}`));
     const explicitAnswer =
+      explicitVotingAgeAnswer(body.message, chunks) ??
       explicitArticleAnswer(body.message, chunks) ??
       explicitTopicAnswer(body.message, chunks) ??
       explicitTitleAnswer(body.message, chunks);
     const context = buildContext(chunks, body.message);
     const messages: ChatMessage[] = [
       { role: "system", content: SYSTEM_PROMPT },
-      ...session.messages.slice(-MAX_HISTORY_MESSAGES),
+      ...(isContextualFollowUp(body.message)
+        ? session.messages.slice(-MAX_HISTORY_MESSAGES)
+        : []),
       {
         role: "user",
         content: `Consulta:\n${body.message}\n\nFragmentos normativos recuperados:\n${context || "(No se recuperaron fragmentos relevantes.)"}`,
@@ -611,20 +729,35 @@ export class LegalChatService implements ChatService {
             .join("\n")
         : (generated.message ?? "").trim();
 
-    session.messages.push(
-      { role: "user", content: body.message },
-      { role: "assistant", content: answer },
-    );
-    if (session.messages.length > MAX_HISTORY_MESSAGES) {
-      session.messages.splice(0, session.messages.length - MAX_HISTORY_MESSAGES);
-    }
-
-    return {
+    const result: ChatResult = {
       sessionId,
       status: generated.status,
       answer,
       sources,
     };
+    if (session.answers.size >= MAX_CACHED_ANSWERS_PER_SESSION) {
+      const oldestQuestion = session.answers.keys().next().value;
+      if (oldestQuestion) {
+        session.answers.delete(oldestQuestion);
+      }
+    }
+    session.answers.set(questionKey, result);
+    this.appendSessionMessages(session, body.message, answer);
+    return result;
+  }
+
+  private appendSessionMessages(
+    session: ChatSession,
+    question: string,
+    answer: string,
+  ): void {
+    session.messages.push(
+      { role: "user", content: question },
+      { role: "assistant", content: answer },
+    );
+    if (session.messages.length > MAX_HISTORY_MESSAGES) {
+      session.messages.splice(0, session.messages.length - MAX_HISTORY_MESSAGES);
+    }
   }
 
   private getSession(sessionId: string): ChatSession {
@@ -642,7 +775,7 @@ export class LegalChatService implements ChatService {
       }
     }
 
-    const session = { messages: [] };
+    const session = { answers: new Map<string, ChatResult>(), messages: [] };
     this.sessions.set(sessionId, session);
     return session;
   }
